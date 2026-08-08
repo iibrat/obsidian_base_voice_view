@@ -1,9 +1,9 @@
+import * as obsidian from "obsidian";
 import {
 	BasesAllOptions,
 	BasesDropdownOption,
 	BasesPropertyId,
 	BasesPropertyOption,
-	BasesView,
 	BasesViewConfig,
 	Keymap,
 	NullValue,
@@ -16,16 +16,119 @@ import { AudioTarget, getCachedContent, resolveAudioLink, resolveImageLink } fro
 export const WATERFALL_VIEW_TYPE = "waterfall-view";
 const MAX_PROPERTIES = 8;
 
-export class WaterfallView extends BasesView {
+// 运行时动态决定基类：
+// - 如果 obsidian 模块未导出 BasesView（旧版 Obsidian / 移动端不包含 Bases），
+//   extends undefined 会直接抛错导致整个插件加载失败。用空类兜底，
+//   main.ts 里有保护逻辑不会真的去实例化它。
+// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/naming-convention
+const BasesViewRuntime: any =
+	typeof (obsidian as unknown as { BasesView?: unknown }).BasesView === "function"
+		? (obsidian as unknown as { BasesView: unknown }).BasesView
+		: class {};
+
+// 模块级单例：整个 Obsidian 窗口所有 Waterfall 卡片共享同一当前播放项，确保同一时间只播放一个。
+let activeAudio: HTMLAudioElement | null = null;
+
+/** 暂停并重置当前正在播放的互斥音频（若它已从 DOM 分离也一并清理引用）。 */
+function stopActiveAudio(removeIfDetached = false): void {
+	const cur = activeAudio;
+	if (!cur) return;
+	try {
+		if (!cur.paused) cur.pause();
+		// 停止后回到 0，下次其他卡片播放不会导致"暂停了但进度条还在中间"。
+		cur.currentTime = 0;
+	} catch {
+		/* ignore: detached / invalid element */
+	}
+	if (removeIfDetached && !cur.isConnected) {
+		activeAudio = null;
+		return;
+	}
+}
+
+/** 登记一个音频元素为"当前活动音频"，播放时自动暂停上一个。 */
+function registerAudioForMutualExclusion(audio: HTMLAudioElement): () => void {
+	const onPlay = () => {
+		if (activeAudio && activeAudio !== audio) {
+			stopActiveAudio();
+		}
+		activeAudio = audio;
+	};
+	const onStop = () => {
+		if (activeAudio === audio) activeAudio = null;
+	};
+	audio.addEventListener("play", onPlay);
+	audio.addEventListener("ended", onStop);
+	audio.addEventListener("emptied", onStop);
+	// pause 不清全局引用（用户手动暂停后再继续应仍属同一个活动项），
+	// 但"下次别的 audio 播放时"会自动把它停止，所以不会泄露。
+	return () => {
+		audio.removeEventListener("play", onPlay);
+		audio.removeEventListener("ended", onStop);
+		audio.removeEventListener("emptied", onStop);
+		if (activeAudio === audio) {
+			try {
+				if (!audio.paused) audio.pause();
+				audio.currentTime = 0;
+			} catch {
+				/* noop */
+			}
+			activeAudio = null;
+		}
+	};
+}
+
+export class WaterfallView extends BasesViewRuntime {
 	type = WATERFALL_VIEW_TYPE;
 
 	private rootEl: HTMLElement;
 	private renderToken = 0;
 	private cardEls = new Map<string, HTMLElement>();
+	private audioCleanups: Array<() => void> = []; // 本视图内所有互斥监听器的卸载函数
 
 	constructor(controller: QueryController, containerEl: HTMLElement) {
 		super(controller);
 		this.rootEl = containerEl.createDiv({ cls: "bases-waterfall-root" });
+
+		// 视图关闭/切换清理：当 rootEl 从 DOM 中分离，说明本视图被卸载，清理互斥监听器并停止仍在播放的音频。
+		// - 轮询兜底（setInterval 1s）：处理快速切换、Bases 框架未触发明确 close 的情况。
+		// - Monkey-patch 自身 onClose：BasesView 运行时基类存在 onClose，类型未暴露，用动态替换兜住。
+		let guard: ReturnType<typeof setInterval> | null = null;
+		const shutdown = () => {
+			if (guard != null) {
+				clearInterval(guard);
+				guard = null;
+			}
+			this.clearAudioCleanups();
+			stopActiveAudio();
+		};
+		// 注意：这里必须用全局标准 setInterval，不能写 window.setInterval，
+		// 因为移动版 Obsidian 部分 WebView 环境里 setInterval 是 ECMAScript 全局，不应绑定到 window。
+		guard = globalThis.setInterval(() => {
+			if (!this.rootEl.isConnected) shutdown();
+		}, 1000);
+
+		const anyThis = this as unknown as { onClose?: () => void };
+		const origClose = anyThis.onClose?.bind(this);
+		anyThis.onClose = () => {
+			try {
+				origClose?.();
+			} catch {
+				/* noop */
+			}
+			shutdown();
+		};
+	}
+
+	private clearAudioCleanups() {
+		let cleanup: (() => void) | undefined;
+		while ((cleanup = this.audioCleanups.pop())) {
+			try {
+				cleanup();
+			} catch {
+				/* noop */
+			}
+		}
 	}
 
 	onDataUpdated(): void {
@@ -46,6 +149,10 @@ export class WaterfallView extends BasesView {
 	}
 
 	render(): void {
+		// 重新渲染前：如果之前的活动音频已随旧卡片从 DOM 分离，就暂停并清掉引用，避免"看不见的卡片仍在播放"。
+		this.clearAudioCleanups();
+		stopActiveAudio(true);
+
 		const token = ++this.renderToken;
 		this.cardEls.clear();
 		this.rootEl.empty();
@@ -59,7 +166,10 @@ export class WaterfallView extends BasesView {
 		// 按文件修改时间降序排列：最新笔记在前。
 		const entries = rawEntries
 			.slice()
-			.sort((a, b) => (b.file.stat?.mtime ?? 0) - (a.file.stat?.mtime ?? 0));
+			.sort(
+				(a: { file: TFile }, b: { file: TFile }) =>
+					(b.file.stat?.mtime ?? 0) - (a.file.stat?.mtime ?? 0)
+			);
 
 		const order = this.config.getOrder();
 		const imagePropId = this.config.getAsPropertyId("imageProperty");
@@ -219,7 +329,7 @@ export class WaterfallView extends BasesView {
 		return file ? { kind: "file", file } : null;
 	}
 
-	/** 在指定容器内渲染 audio 控件，处理事件冒泡防止触发卡片跳转。 */
+	/** 在指定容器内渲染 audio 控件，处理事件冒泡防止触发卡片跳转，并登记到全局互斥。 */
 	private renderAudioElement(wrap: HTMLElement, target: AudioTarget): void {
 		const src = target.kind === "file" ? this.app.vault.getResourcePath(target.file) : target.url;
 		const audio = wrap.createEl("audio", {
@@ -230,6 +340,9 @@ export class WaterfallView extends BasesView {
 		["click", "mousedown", "mouseup", "play", "pause", "seeked", "input", "change"].forEach((ev) => {
 			audio.addEventListener(ev, stop);
 		});
+		// 加入全局互斥（同一时刻只有一个可播放），并保存卸载钩子以便重渲染/视图关闭时清理。
+		const cleanup = registerAudioForMutualExclusion(audio);
+		this.audioCleanups.push(cleanup);
 	}
 
 	private async fillAsync(
