@@ -1,0 +1,9 @@
+{
+	"id": "bases-waterfall-view",
+	"name": "Bases Waterfall View",
+	"version": "1.0.0",
+	"minAppVersion": "1.9.0",
+	"description": "为 Obsidian Bases（数据库）增加一个卡片瀑布流视图，以瀑布流形式展示笔记内容。",
+	"author": "Ivan",
+	"isDesktopOnly": true
+}
